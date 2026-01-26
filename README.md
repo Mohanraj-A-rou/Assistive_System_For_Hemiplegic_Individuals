@@ -1,10 +1,10 @@
 # hand-gesture
 hand gesture project code instructions
 
-for using the "1.Sample code for the hand gesture recognition for vscode" and "2.Recognition for vscode and pushbullet" use with the 3rd file named "gesture_reconizer.task"
+--->>for using the "1.Sample code for the hand gesture recognition for vscode" and "2.Recognition for vscode and pushbullet" use with the 3rd file named "gesture_reconizer.task"
 _______________________end_________________________________
 
-for using "05_gesture_fall_storke.py"
+--->>for using "05_gesture_fall_storke.py"
 
 Gesture recognition, fall detection and stroke detection
 
