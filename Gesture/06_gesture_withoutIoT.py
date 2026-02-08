@@ -57,11 +57,11 @@ def identify_gesture(f):
     # [Thumb, Index, Middle, Ring, Pinky]
     
     # --- MODIFIED MAPPINGS ---
-    if f == [1, 0, 0, 0, 0]: return "Adjust Position"
     if f == [1, 1, 0, 0, 0]: return "Need Water/Food"
     if f == [0, 1, 0, 0, 0]: return "Want Restroom"
     if f == [0, 0, 1, 1, 1]: return "Want Medicine"
     if f == [0, 1, 1, 0, 0]: return "Call Caregiver"
+    if f == [1, 0, 0, 0, 0]: return "Adjust Position"
     if f == [1, 1, 1, 0, 0]: return "Uncomfortable"
     
     return None
@@ -142,3 +142,4 @@ while True:
 
 cap.release()
 cv2.destroyAllWindows()
+
