@@ -1,4 +1,4 @@
-**ASSISTIVE SYSTEM FOR HEMIPLEGIC INDIVIDUALS**
+# ASSISTIVE SYSTEM FOR HEMIPLEGIC INDIVIDUALS
 
 - The system is for the Hemiplegia(paralysis on one side) with dysarthria(motor speech disorder) or aphasia(language disorder), this system includes,
 - Computer vision-based gesture recognition system, it used to contol the light and fans in the home(IoT), and it send the pre-defined commands to the caretaker by the gesture shown by hemilegic person.
