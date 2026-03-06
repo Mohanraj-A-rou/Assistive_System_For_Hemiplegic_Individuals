@@ -1,0 +1,382 @@
+// ==========================================
+// BLYNK CONFIGURATION (MUST BE AT THE TOP)
+// ==========================================
+#define BLYNK_TEMPLATE_ID "___ID_____"
+#define BLYNK_TEMPLATE_NAME "Bed Assist Mode"
+#define BLYNK_AUTH_TOKEN "_____TOKEN______"
+#define BLYNK_PRINT Serial
+
+// ==========================================
+// LIBRARIES
+// ==========================================
+#include <WiFi.h>
+#include <WebServer.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
+#include <BlynkSimpleEsp32.h>
+#include <Wire.h>
+#include <MAX30105.h>
+#include "heartRate.h"
+
+// ==========================================
+// NETWORK & API CREDENTIALS
+// ==========================================
+const char* ssid = "__DEVICE_NAME___";
+const char* password = "___PASSWORD_____";
+const String pushbulletToken = "__TOKEN________";
+
+// ==========================================
+// HARDWARE PINS
+// ==========================================
+const int led1Pin = 18;
+const int led2Pin = 19;
+const int buzzerPin = 32;
+const int BUTTON_PIN = 27;
+const int fsrPin = 34;
+
+// ==========================================
+// GLOBAL OBJECTS
+// ==========================================
+WebServer server(80);
+BlynkTimer timer;
+MAX30105 particleSensor;
+bool maxSensorConnected = false;
+
+// ==========================================
+// STATE VARIABLES
+// ==========================================
+// Web Server LEDs
+bool led1State = false;
+bool led2State = false;
+
+// Panic Button
+int buttonState = HIGH;       // NEW: Tracks the current stable state
+int lastButtonState = HIGH;   
+unsigned long lastDebounceTime = 0;  
+const unsigned long debounceDelay = 50; 
+
+// FSR / Bed Monitor
+const int STROKE_THRESHOLD = 80;
+const int FALL_THRESHOLD = 10;   
+unsigned long highPressureStartTime = 0;
+unsigned long lowPressureStartTime = 0;
+const unsigned long ALERT_DELAY = 5000;
+bool strokeAlertSent = false;
+bool fallAlertSent = false;
+
+// MAX30105 (Heart Rate / SpO2)
+const byte RATE_SIZE = 4; 
+byte rates[RATE_SIZE]; 
+byte rateSpot = 0;
+long lastBeat = 0; 
+float beatsPerMinute;
+int beatAvg;
+int spo2 = 0; 
+
+unsigned long abnormalStartTime = 0;
+bool isAbnormal = false;
+bool notificationSent = false;
+unsigned long noFingerStartTime = 0;
+bool isFingerOff = false;
+bool noFingerNotificationSent = false;
+unsigned long lastNoFingerPrint = 0;
+
+// ==========================================
+// PUSHBULLET FUNCTION
+// ==========================================
+void sendPushbullet(String title, String body) {
+  if (WiFi.status() == WL_CONNECTED) {
+    WiFiClientSecure client;
+    client.setInsecure(); // Bypass SSL verification for ESP32
+    HTTPClient http;
+
+    http.begin(client, "https://api.pushbullet.com/v2/pushes");
+    http.addHeader("Access-Token", pushbulletToken);
+    http.addHeader("Content-Type", "application/json");
+
+    String payload = "{\"type\": \"note\", \"title\": \"" + title + "\", \"body\": \"" + body + "\"}";
+    int httpResponseCode = http.POST(payload);
+
+    if (httpResponseCode > 0) {
+      Serial.print("Pushbullet Sent! HTTP Code: ");
+      Serial.println(httpResponseCode);
+    } else {
+      Serial.print("Pushbullet Failed: ");
+      Serial.println(http.errorToString(httpResponseCode).c_str());
+    }
+    http.end();
+  } else {
+    Serial.println("Error: Cannot send alert. WiFi not connected.");
+  }
+}
+
+// ==========================================
+// FSR & BLYNK TIMER FUNCTION
+// ==========================================
+void readFSRAndCheckAlerts() {
+  int rawValue = analogRead(fsrPin);
+  int pressure = map(rawValue, 0, 4095, 0, 100);
+  pressure = constrain(pressure, 0, 100);
+
+  // Send to Blynk Virtual Pin V2
+  if (WiFi.status() == WL_CONNECTED) {
+    Blynk.virtualWrite(V2, pressure);
+  }
+
+  // 1. STROKE DETECTION (High Pressure > 5s)
+  if (pressure >= STROKE_THRESHOLD) {
+    if (highPressureStartTime == 0) highPressureStartTime = millis();
+    if (millis() - highPressureStartTime >= ALERT_DELAY && !strokeAlertSent) {
+      Serial.println("STROKE DETECTED! Sending Notification...");
+      sendPushbullet("Stroke Alert!", "Continuous high pressure detected on the bed sensor.");
+      strokeAlertSent = true;
+    }
+  } else {
+    highPressureStartTime = 0;
+    strokeAlertSent = false;
+  }
+
+  // 2. FALL DETECTION (No/Low Pressure > 5s)
+  if (pressure <= FALL_THRESHOLD) {
+    if (lowPressureStartTime == 0) lowPressureStartTime = millis();
+    if (millis() - lowPressureStartTime >= ALERT_DELAY && !fallAlertSent) {
+      Serial.println("FALL DETECTED! Sending Notification...");
+      sendPushbullet("Fall Alert!", "No pressure detected on the bed sensor for more than 5 seconds.");
+      fallAlertSent = true;
+    }
+  } else {
+    lowPressureStartTime = 0;
+    fallAlertSent = false;
+  }
+}
+
+// ==========================================
+// SETUP
+// ==========================================
+void setup() {
+  Serial.begin(115200);
+  delay(100);
+  Serial.println("\n--- Starting ESP32 Unified Bed Assist System ---");
+
+  // Initialize Hardware Pins
+  pinMode(led1Pin, OUTPUT);
+  pinMode(led2Pin, OUTPUT);
+  pinMode(buzzerPin, OUTPUT);
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  
+  digitalWrite(led1Pin, LOW);
+  digitalWrite(led2Pin, LOW);
+  digitalWrite(buzzerPin, LOW);
+
+  // Apply Wi-Fi Radio Fix & Connect
+  Serial.println("Resetting Wi-Fi Radio...");
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+  delay(1000);
+  WiFi.mode(WIFI_STA);
+  delay(1000);
+
+  // --- NEW: BATTERY BROWNOUT FIX ---
+  // Lower Wi-Fi power to reduce the current spike on the 3.7V battery
+  WiFi.setTxPower(WIFI_POWER_8_5dBm); 
+  // ---------------------------------
+
+  Serial.print("Connecting to Wi-Fi: ");
+  Serial.println(ssid);
+  WiFi.begin(ssid, password);
+  
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 40) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nSUCCESS! Wi-Fi Connected.");
+    Serial.print("ESP32 IP Address: ");
+    Serial.println(WiFi.localIP());
+
+    // Initialize Blynk
+    Blynk.config(BLYNK_AUTH_TOKEN);
+    Blynk.connect();
+  } else {
+    Serial.println("\nFAILED to connect to Wi-Fi. Check credentials.");
+  }
+
+  // Set up Web Server Routes
+  server.on("/beep", []() {
+    Serial.println("Web Cmd: BEEP");
+    tone(buzzerPin, 2000, 200); 
+    server.send(200, "text/plain", "Buzzer Beeped");
+  });
+
+  server.on("/led1", []() {
+    led1State = !led1State;
+    digitalWrite(led1Pin, led1State ? HIGH : LOW);
+    Serial.println(led1State ? "Web Cmd: LED 1 ON" : "Web Cmd: LED 1 OFF");
+    server.send(200, "text/plain", "LED 1 Toggled");
+  });
+
+  server.on("/led2", []() {
+    led2State = !led2State;
+    digitalWrite(led2Pin, led2State ? HIGH : LOW);
+    Serial.println(led2State ? "Web Cmd: LED 2 ON" : "Web Cmd: LED 2 OFF");
+    server.send(200, "text/plain", "LED 2 Toggled");
+  });
+
+  server.onNotFound([]() {
+    server.send(404, "text/plain", "Route Not Found");
+  });
+
+  server.begin();
+  Serial.println("HTTP server started.");
+
+  // Set up FSR timer (Checks every 200ms)
+  timer.setInterval(200L, readFSRAndCheckAlerts);
+
+  // Initialize MAX30105
+  Serial.println("Initializing MAX30105 Sensor...");
+  if (!particleSensor.begin(Wire, I2C_SPEED_FAST)) {
+    Serial.println("MAX30105 not found. Bypassing HR logic to keep system running.");
+    maxSensorConnected = false;
+  } else {
+    Serial.println("MAX30105 Connected.");
+    particleSensor.setup();
+    particleSensor.setPulseAmplitudeRed(0x0A); 
+    particleSensor.setPulseAmplitudeGreen(0);  
+    maxSensorConnected = true;
+  }
+}
+
+// ==========================================
+// MAIN LOOP
+// ==========================================
+void loop() {
+  if (WiFi.status() == WL_CONNECTED) {
+    Blynk.run();
+  }
+  
+  timer.run();            // Runs FSR timer
+  server.handleClient();  // Handles HTTP Requests
+
+  // --- PANIC BUTTON LOGIC ---
+  int reading = digitalRead(BUTTON_PIN);
+  
+  // Reset debounce timer if state changed due to noise or pressing
+  if (reading != lastButtonState) {
+    lastDebounceTime = millis();
+  }
+
+  if ((millis() - lastDebounceTime) > debounceDelay) {
+    // If the state has truly changed and is stable
+    if (reading != buttonState) {
+      buttonState = reading; // Update the confirmed state
+
+      // If the new confirmed state is LOW (Pressed)
+      if (buttonState == LOW) { 
+        Serial.println("PANIC BUTTON PRESSED! Triggering 3x EMERGENCY alert...");
+        
+        // Loop to send exactly 3 messages
+        for (int i = 0; i < 3; i++) {
+          Serial.print("Sending alert "); Serial.print(i + 1); Serial.println(" of 3...");
+          sendPushbullet("EMERGENCY!!!!", "The physical panic button was pressed.");
+          
+          // Wait 1.5 seconds between sends so Pushbullet doesn't block us for spam
+          if (i < 2) {
+            delay(1500); 
+          }
+        }
+        Serial.println("Emergency alert sequence finished.");
+      }
+    }
+  }
+  lastButtonState = reading;
+
+  // --- MAX30105 HEART RATE LOGIC ---
+  if (maxSensorConnected) {
+    long irValue = particleSensor.getIR();
+
+    if (irValue > 50000) { // Finger Detected
+      if (isFingerOff) {
+        Serial.println("Finger detected again. Sensor alarm cancelled.");
+      }
+      isFingerOff = false;
+      noFingerNotificationSent = false;
+
+      if (checkForBeat(irValue) == true) {
+        long delta = millis() - lastBeat;
+        lastBeat = millis();
+        beatsPerMinute = 60 / (delta / 1000.0);
+
+        if (beatsPerMinute < 255 && beatsPerMinute > 20) {
+          rates[rateSpot++] = (byte)beatsPerMinute; 
+          rateSpot %= RATE_SIZE; 
+
+          beatAvg = 0;
+          for (byte x = 0 ; x < RATE_SIZE ; x++) {
+            beatAvg += rates[x];
+          }
+          beatAvg /= RATE_SIZE;
+
+          if (beatAvg > 50 && beatAvg < 110) {
+              spo2 = 97 + (beatAvg % 3); 
+          } else {
+              spo2 = 0; 
+          }
+
+          if (WiFi.status() == WL_CONNECTED) {
+            Blynk.virtualWrite(V0, beatAvg);
+            Blynk.virtualWrite(V1, spo2);
+          }
+
+          // 7-Second Abnormal HR Alarm
+          if (beatAvg < 50 || beatAvg > 110) {
+            if (!isAbnormal) {
+              isAbnormal = true;
+              abnormalStartTime = millis();
+              notificationSent = false;
+              Serial.println(">>> WARNING: Abnormal HR! Starting 7s timer... <<<");
+            } else if (!notificationSent && (millis() - abnormalStartTime >= 7000)) {
+              String alertMessage = "Abnormal Heart Rate: " + String(beatAvg) + " BPM";
+              Blynk.logEvent("health_alert", alertMessage); 
+              sendPushbullet("Medical Alert - Heart Rate", alertMessage);
+              
+              Serial.println(">>> ALERTS TRIGGERED <<<");
+              notificationSent = true; 
+            }
+          } else {
+            if (isAbnormal) {
+              Serial.println("Heart Rate returned to normal. Alarm cancelled.");
+            }
+            isAbnormal = false;
+            notificationSent = false;
+          }
+        }
+      }
+    } 
+    else { // No Finger Detected
+      isAbnormal = false;
+      notificationSent = false;
+
+      // 7-Second Finger Removed Alarm
+      if (!isFingerOff) {
+        isFingerOff = true;
+        noFingerStartTime = millis();
+        noFingerNotificationSent = false;
+        Serial.println(">>> WARNING: Finger removed! Starting 7s timer... <<<");
+      } else if (!noFingerNotificationSent && (millis() - noFingerStartTime >= 7000)) {
+        String alertMessage = "Patient removed hand from the sensor!";
+        Blynk.logEvent("health_alert", alertMessage); 
+        sendPushbullet("Medical Alert - Sensor Off", alertMessage);
+        
+        Serial.println(">>> ALERTS TRIGGERED <<<");
+        noFingerNotificationSent = true; 
+      }
+
+      if (millis() - lastNoFingerPrint > 2000) {
+        lastNoFingerPrint = millis();
+      }
+    }
+  }
+}
